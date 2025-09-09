@@ -1,16 +1,22 @@
+# /backend/app/main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance  # Add this import
 import os
 import uuid
 from typing import Annotated
-from pydantic import BaseModel
-from .ai_processor import AiProcessor
-from .background_removal import remove_background
 
-app_version = "1.0.0"
-app = FastAPI(title="ImageEdit Ai", version=app_version)
+from .models import (
+    HealthCheckResponse, UploadResponse, ProcessRequest, 
+    AIProcessRequest, ProcessResponse
+)
+from .services.image_service import ImageService
+from .services.ai_processor import AiProcessor
+from .config import config
+
+app_version = "1.0.1"
+app = FastAPI(title="ImageEdit AI", version=app_version)
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,9 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
-
 # Create directories for uploads if they don't exist
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("processed", exist_ok=True)
@@ -30,39 +33,26 @@ os.makedirs("processed", exist_ok=True)
 # Initialize AI processor
 ai_processor = AiProcessor()
 
-# Pydantic model for form data
-# class ImageAdjustments(BaseModel):
-#     brightness: float = 1.0
-#     contrast: float = 1.0
-#     saturation: float = 1.0
-
-
-
 @app.get("/")
-def read_root():
-    return {"Message": "Welcome to ImageEdit Ai"}
+async def read_root():
+    return {"Message": "Welcome to ImageEdit AI"}
 
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy", 
-        "service": "ImageEdit Ai",
-        "version": app_version,
-    }
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check():
+    return HealthCheckResponse(
+        status="healthy", 
+        service="ImageEdit AI",
+        version=app_version,
+    )
 
-
-@app.post("/upload/")
+@app.post("/upload/", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)):
     # Check valid file extension
-    file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    accepted_extensions = ["jpg", "jpeg", "png", "bmp", "gif"]
-
-    if file_extension.lower() not in accepted_extensions:
+    if not ImageService.validate_extension(file.filename):
         raise HTTPException(status_code=400, detail="Unsupported file type")
     
     try:
-        # Generate a unique filename
-        filename = f"{uuid.uuid4()}.{file_extension}"
+        filename = ImageService.generate_filename(file.filename)
         file_path = f"uploads/{filename}"
 
         # Save the file
@@ -70,28 +60,22 @@ async def upload_file(file: UploadFile = File(...)):
             content = await file.read()
             buffer.write(content)
 
-        return {"filename": filename, "message": "File uploaded successfully"}
+        return UploadResponse(filename=filename, message="File uploaded successfully")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/process/")
+@app.post("/process/", response_model=ProcessResponse)
 async def process_image(
     file: UploadFile = File(...),
-    brightness: Annotated[float, Form()] = 1.0,
-    contrast: Annotated[float, Form()] = 1.0,
-    saturation: Annotated[float, Form()] = 1.0
+    adjustments: ProcessRequest = Depends()
 ):
     try:
-        # Check file extension
-        file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        accepted_extensions = ["jpg", "jpeg", "png", "bmp", "gif"]
-        
-        if file_extension.lower() not in accepted_extensions:
+        if not ImageService.validate_extension(file.filename):
             raise HTTPException(status_code=400, detail="Unsupported file type")
         
-        input_filename = f"{uuid.uuid4()}.{file_extension}"
-        output_filename = f"{uuid.uuid4()}_processed.{file_extension}"
+        input_filename = ImageService.generate_filename(file.filename)
+        output_filename = ImageService.generate_filename(file.filename, "_processed")
 
         input_path = f"uploads/{input_filename}"
         output_path = f"processed/{output_filename}"
@@ -103,125 +87,113 @@ async def process_image(
 
         # Open image and apply transformations
         image = Image.open(input_path)
-
-        # Adjust brightness
-        if brightness != 1.0:
-            enhancer = ImageEnhance.Brightness(image)
-            image = enhancer.enhance(brightness)
-
-        # Adjust contrast
-        if contrast != 1.0:
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(contrast)
-
-        # Adjust saturation
-        if saturation != 1.0:
-            enhancer = ImageEnhance.Color(image)
-            image = enhancer.enhance(saturation)
+        image = ImageService.apply_adjustments(
+            image,
+            brightness=adjustments.brightness,
+            contrast=adjustments.contrast,
+            saturation=adjustments.saturation
+        )
 
         # Save processed image
         image.save(output_path)
 
-        return {
-            "message": "Image processed successfully",
-            "processed_url": f"/download/{output_filename}"
-        }
+        return ProcessResponse(
+            message="Image processed successfully",
+            processed_url=f"/download/{output_filename}"
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-    
 
-@app.post("/ai_process/")
+@app.post("/ai_process/", response_model=ProcessResponse)
 async def ai_process_image(
     file: UploadFile = File(...),
-    prompt: str = Form(...)
+    ai_request: AIProcessRequest = Depends()
 ):
     try:
+        if not ImageService.validate_extension(file.filename):
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+        
         # Use AI to understand what the user wants
-        action = ai_processor.classify_prompt(prompt)
-        print(f"Ai prompt '{prompt}' and found {len(action)} actions")
+        actions = ai_processor.classify_prompt(ai_request.prompt)
+        print(f"AI prompt '{ai_request.prompt}' found {len(actions)} actions")
 
-        # create unique filenames
-        file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        input_filename = f"{uuid.uuid4()}.{file_extension}"
-        output_filename = f"{uuid.uuid4()}_processed.{file_extension}"
+        # Generate filenames
+        input_filename = ImageService.generate_filename(file.filename)
+        output_filename = ImageService.generate_filename(file.filename, "_processed")
 
         input_path = f"uploads/{input_filename}"
         output_path = f"processed/{output_filename}"
 
-        # save uploaded file
+        # Save uploaded file
         with open(input_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
-        # open image
+        # Open image
         image = Image.open(input_path)
-
-        # Apply actions
         adjustment_applied = {}
-        background_removed = False  # Initialize the variable here
+        background_removed = False
 
-        for act in action:
-            action_name = act["action"]
-            action_confidence = act["confidence"]
+        # Apply AI-suggested actions
+        if actions:
+            for act in actions:
+                if act.action == "increase brightness":
+                    adjust_amount = 1 + act.confidence
+                    enhancer = ImageEnhance.Brightness(image)
+                    image = enhancer.enhance(adjust_amount)  
+                    adjustment_applied["brightness"] = adjust_amount
 
-            if action_name == "increase brightness":
-                adjust_amount = 1 + action_confidence  # Scale by confidence
-                enhancer = ImageEnhance.Brightness(image)
-                image = enhancer.enhance(adjust_amount)  
-                adjustment_applied["brightness"] = adjust_amount
+                elif act.action == "decrease brightness":
+                    adjust_amount = max(0.1, 1 - act.confidence)
+                    enhancer = ImageEnhance.Brightness(image)
+                    image = enhancer.enhance(adjust_amount)
+                    adjustment_applied["brightness"] = adjust_amount
 
-            elif action_name == "decrease brightness":
-                adjust_amount = max(0, 1 - action_confidence)
-                enhancer = ImageEnhance.Brightness(image)
-                image = enhancer.enhance(adjust_amount)
-                adjustment_applied["brightness"] = adjust_amount
+                elif act.action == "increase contrast":
+                    adjust_amount = 1 + act.confidence
+                    enhancer = ImageEnhance.Contrast(image)
+                    image = enhancer.enhance(adjust_amount)
+                    adjustment_applied["contrast"] = adjust_amount
 
-            elif action_name == "increase contrast":
-                adjust_amount = 1 + action_confidence
-                enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(adjust_amount)
-                adjustment_applied["contrast"] = adjust_amount
+                elif act.action == "decrease contrast":
+                    adjust_amount = max(0.1, 1 - act.confidence)
+                    enhancer = ImageEnhance.Contrast(image)
+                    image = enhancer.enhance(adjust_amount)
+                    adjustment_applied["contrast"] = adjust_amount
 
-            elif action_name == "decrease contrast":
-                adjust_amount = max(0, 1 - action_confidence)
-                enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(adjust_amount)
-                adjustment_applied["contrast"] = adjust_amount
+                elif act.action == "increase saturation":
+                    adjust_amount = 1 + act.confidence
+                    enhancer = ImageEnhance.Color(image)
+                    image = enhancer.enhance(adjust_amount)
+                    adjustment_applied["saturation"] = adjust_amount
 
-            elif action_name == "increase saturation":
-                adjust_amount = 1 + action_confidence
-                enhancer = ImageEnhance.Color(image)
-                image = enhancer.enhance(adjust_amount)
-                adjustment_applied["saturation"] = adjust_amount
+                elif act.action == "decrease saturation":
+                    adjust_amount = max(0.1, 1 - act.confidence)
+                    enhancer = ImageEnhance.Color(image)
+                    image = enhancer.enhance(adjust_amount)
+                    adjustment_applied["saturation"] = adjust_amount
 
-            elif action_name == "decrease saturation":
-                adjust_amount = max(0, 1 - action_confidence)
-                enhancer = ImageEnhance.Color(image)
-                image = enhancer.enhance(adjust_amount)
-                adjustment_applied["saturation"] = adjust_amount
-
-            elif action_name == "remove background":
-                image = remove_background(image)
-                adjustment_applied["background_removal"] = True
-                background_removed = True
+                elif act.action == "remove background":
+                    image = ImageService.remove_background(image)
+                    adjustment_applied["background_removal"] = True
+                    background_removed = True
         
         # Save processed image
         if background_removed:
-            image.save(output_path, format="PNG")  # Save as PNG to preserve transparency
+            image.save(output_path, format="PNG")
         else:
             image.save(output_path)
         
-        return {
-            "message": "Image processed successfully",
-            "processed_url": f"/download/{output_filename}",
-            "ai_actions": action,
-            "adjustments_applied": adjustment_applied
-        }
+        return ProcessResponse(
+            message="Image processed successfully",
+            processed_url=f"/download/{output_filename}",
+            ai_actions=actions,
+            adjustments_applied=adjustment_applied
+        )
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
-
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
